@@ -1,0 +1,199 @@
+trigger:
+- main
+
+pool:
+  vmImage: 'ubuntu-latest'
+
+variables:
+  # Maven
+  MAVEN_CACHE_FOLDER: $(Pipeline.Workspace)/.m2/repository
+  MAVEN_OPTS: '-Dmaven.repo.local=$(MAVEN_CACHE_FOLDER)'
+  # SonarQube
+  SONAR_PROJECT_KEY: 'vulnado'
+  SONAR_ORGANIZATION: 'your-sonar-organization'
+  SONAR_URL: 'https://sonarcloud.io'
+  # Snyk
+  SNYK_ORGANIZATION: 'your-snyk-organization'
+  # OWASP ZAP
+  ZAP_TARGET_URL: 'http://localhost:8080'
+
+stages:
+- stage: Build
+  displayName: 'Build and Unit Tests'
+  jobs:
+  - job: BuildAndTest
+    displayName: 'Build and Test'
+    steps:
+    - task: Cache@2
+      inputs:
+        key: 'maven | "$(Agent.OS)" | pom.xml'
+        restoreKeys: |
+          maven | "$(Agent.OS)"
+        path: $(MAVEN_CACHE_FOLDER)
+      displayName: 'Cache Maven packages'
+
+    - task: Maven@3
+      displayName: 'Build and Run Unit Tests'
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'clean package'
+        options: '$(MAVEN_OPTS)'
+        publishJUnitResults: true
+        testResultsFiles: '**/surefire-reports/TEST-*.xml'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.8'
+        mavenVersionOption: 'Default'
+        mavenOptions: '-Xmx3072m'
+
+    - task: CopyFiles@2
+      displayName: 'Copy JAR to Staging Directory'
+      inputs:
+        SourceFolder: '$(System.DefaultWorkingDirectory)/target'
+        Contents: '*.jar'
+        TargetFolder: '$(Build.ArtifactStagingDirectory)'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish Build Artifacts'
+      inputs:
+        PathtoPublish: '$(Build.ArtifactStagingDirectory)'
+        ArtifactName: 'drop'
+        publishLocation: 'Container'
+
+- stage: SAST_NoCodeCoverage
+  displayName: 'SAST with SonarQube (No Code Coverage)'
+  dependsOn: Build
+  jobs:
+  - job: SonarQubeAnalysis
+    displayName: 'SonarQube Analysis'
+    steps:
+    - task: SonarCloudPrepare@1
+      displayName: 'Prepare SonarCloud Analysis'
+      inputs:
+        SonarCloud: 'SonarCloud'
+        organization: '$(SONAR_ORGANIZATION)'
+        scannerMode: 'Other'
+        extraProperties: |
+          sonar.projectKey=$(SONAR_PROJECT_KEY)
+          sonar.projectName=$(SONAR_PROJECT_KEY)
+          sonar.java.source=1.8
+          sonar.sources=src/main
+          sonar.tests=src/test
+          sonar.java.binaries=target/classes
+          sonar.java.test.binaries=target/test-classes
+          sonar.java.libraries=target/dependency/*.jar
+
+    - task: Maven@3
+      displayName: 'Run SonarQube Analysis'
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'sonar:sonar'
+        options: '$(MAVEN_OPTS)'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.8'
+        mavenVersionOption: 'Default'
+        mavenOptions: '-Xmx3072m'
+
+    - task: SonarCloudPublish@1
+      displayName: 'Publish SonarCloud Results'
+      inputs:
+        pollingTimeoutSec: '300'
+
+- stage: SAST_WithCodeCoverage
+  displayName: 'SAST with SonarQube (With Code Coverage)'
+  dependsOn: Build
+  jobs:
+  - job: SonarQubeWithCoverage
+    displayName: 'SonarQube Analysis with JaCoCo'
+    steps:
+    - task: SonarCloudPrepare@1
+      displayName: 'Prepare SonarCloud Analysis with Code Coverage'
+      inputs:
+        SonarCloud: 'SonarCloud'
+        organization: '$(SONAR_ORGANIZATION)'
+        scannerMode: 'Other'
+        extraProperties: |
+          sonar.projectKey=$(SONAR_PROJECT_KEY)
+          sonar.projectName=$(SONAR_PROJECT_KEY)
+          sonar.java.source=1.8
+          sonar.sources=src/main
+          sonar.tests=src/test
+          sonar.java.binaries=target/classes
+          sonar.java.test.binaries=target/test-classes
+          sonar.java.libraries=target/dependency/*.jar
+          sonar.coverage.jacoco.xmlReportPaths=target/site/jacoco/jacoco.xml
+
+    - task: Maven@3
+      displayName: 'Run Tests with JaCoCo Coverage'
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'clean verify'
+        options: '$(MAVEN_OPTS)'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.8'
+        mavenVersionOption: 'Default'
+        mavenOptions: '-Xmx3072m'
+
+    - task: Maven@3
+      displayName: 'Run SonarQube Analysis with Coverage'
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'sonar:sonar'
+        options: '$(MAVEN_OPTS)'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.8'
+        mavenVersionOption: 'Default'
+        mavenOptions: '-Xmx3072m'
+
+    - task: SonarCloudPublish@1
+      displayName: 'Publish SonarCloud Results'
+      inputs:
+        pollingTimeoutSec: '300'
+
+- stage: SCA_Snyk
+  displayName: 'Software Composition Analysis with Snyk'
+  dependsOn: Build
+  jobs:
+  - job: SnykScan
+    displayName: 'Snyk Security Scan'
+    steps:
+    - task: SnykSecurityScan@1
+      displayName: 'Snyk Security Scan'
+      inputs:
+        serviceConnectionEndpoint: 'Snyk'
+        testType: 'app'
+        monitorWhen: 'always'
+        failOnIssues: false
+        projectName: '$(SONAR_PROJECT_KEY)'
+        organization: '$(SNYK_ORGANIZATION)'
+        targetFile: 'pom.xml'
+
+- stage: DAST_OWASP_ZAP
+  displayName: 'DAST with OWASP ZAP'
+  dependsOn: Build
+  jobs:
+  - job: DeployForTesting
+    displayName: 'Deploy for DAST Testing'
+    steps:
+    - task: Maven@3
+      displayName: 'Start Application for Testing'
+      inputs:
+        mavenPomFile: 'pom.xml'
+        goals: 'spring-boot:run'
+        options: '$(MAVEN_OPTS) -Dserver.port=8080'
+        javaHomeOption: 'JDKVersion'
+        jdkVersionOption: '1.8'
+        mavenVersionOption: 'Default'
+        mavenOptions: '-Xmx3072m'
+      timeoutInMinutes: 5
+      continueOnError: true
+
+  - job: OWASPZAPScan
+    displayName: 'OWASP ZAP Scan'
+    dependsOn: DeployForTesting
+    steps:
+    - task: owaspzap@1
+      displayName: 'OWASP ZAP Scan'
+      inputs:
+        scanType: 'targetedScan'
+        targetUrl: '$(ZAP_TARGET_URL)'
+        failOnAlert: false
